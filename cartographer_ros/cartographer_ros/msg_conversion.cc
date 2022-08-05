@@ -114,6 +114,42 @@ sensor_msgs::PointCloud2 PreparePointCloud2Message(const int64_t timestamp,
   return msg;
 }
 
+// wgh-- <Newly added> Prepare ros point cloud with intensity field.
+sensor_msgs::PointCloud2 PreparePointCloud2MessageWithIntensity(
+                                                const int64_t timestamp,
+                                                const std::string& frame_id,
+                                                const int num_points) 
+{
+  sensor_msgs::PointCloud2 msg;
+  msg.header.stamp = ToRos(::cartographer::common::FromUniversal(timestamp));
+  msg.header.frame_id = frame_id;
+  msg.height = 1;
+  msg.width = num_points;
+  msg.fields.resize(4);
+  msg.fields[0].name = "x";
+  msg.fields[0].offset = 0;
+  msg.fields[0].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[0].count = 1;
+  msg.fields[1].name = "y";
+  msg.fields[1].offset = 4;
+  msg.fields[1].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[1].count = 1;
+  msg.fields[2].name = "z";
+  msg.fields[2].offset = 8;
+  msg.fields[2].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[2].count = 1;
+  msg.fields[3].name = "intensity";
+  msg.fields[3].offset = 12;
+  msg.fields[3].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[3].count = 1;
+  msg.is_bigendian = false;
+  msg.point_step = 16;
+  msg.row_step = 16 * msg.width;
+  msg.is_dense = true;
+  msg.data.resize(16 * num_points);
+  return msg;
+}
+
 // For sensor_msgs::LaserScan.
 bool HasEcho(float) { return true; }
 
@@ -188,7 +224,8 @@ bool PointCloud2HasField(const sensor_msgs::PointCloud2& pc2,
 
 sensor_msgs::PointCloud2 ToPointCloud2Message(
     const int64_t timestamp, const std::string& frame_id,
-    const ::cartographer::sensor::TimedPointCloud& point_cloud) {
+    const ::cartographer::sensor::TimedPointCloud& point_cloud) 
+{
   auto msg = PreparePointCloud2Message(timestamp, frame_id, point_cloud.size());
   ::ros::serialization::OStream stream(msg.data.data(), msg.data.size());
   for (const cartographer::sensor::TimedRangefinderPoint& point : point_cloud) {
@@ -196,6 +233,24 @@ sensor_msgs::PointCloud2 ToPointCloud2Message(
     stream.next(point.position.y());
     stream.next(point.position.z());
     stream.next(kPointCloudComponentFourMagic);
+  }
+  return msg;
+}
+
+// wgh-- Newly added!
+sensor_msgs::PointCloud2 ToPointCloud2Message(
+    const int64_t timestamp, const std::string& frame_id,
+    const ::cartographer::sensor::PointCloudWithIntensities& point_cloud) 
+{
+  auto msg = PreparePointCloud2MessageWithIntensity(timestamp, 
+                                                    frame_id, 
+                                                    point_cloud.points.size());
+  ::ros::serialization::OStream stream(msg.data.data(), msg.data.size());
+  for (std::size_t i=0; i<point_cloud.points.size(); ++i) {
+    stream.next(point_cloud.points[i].position.x());
+    stream.next(point_cloud.points[i].position.y());
+    stream.next(point_cloud.points[i].position.z());
+    stream.next(point_cloud.intensities[i]);
   }
   return msg;
 }

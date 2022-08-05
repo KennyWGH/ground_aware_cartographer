@@ -43,10 +43,18 @@ SensorBridge::SensorBridge(
     const int num_subdivisions_per_laser_scan,
     const std::string& tracking_frame,
     const double lookup_transform_timeout_sec, tf2_ros::Buffer* const tf_buffer,
-    carto::mapping::TrajectoryBuilderInterface* const trajectory_builder)
+    carto::mapping::TrajectoryBuilderInterface* const trajectory_builder,
+    float ground_detection_param)
     : num_subdivisions_per_laser_scan_(num_subdivisions_per_laser_scan),
       tf_bridge_(tracking_frame, lookup_transform_timeout_sec, tf_buffer),
-      trajectory_builder_(trajectory_builder) {}
+      trajectory_builder_(trajectory_builder) 
+{
+  // wgh-- must reset ground points segmentor.
+  ground_detection_params_.kExtrinsicTrans = Eigen::Vector3f(0, 0, 1.3); // 1.3 1.832
+  ground_detection_params_.kExtrinsicRot = Eigen::Matrix3f::Identity();
+  ground_detection_params_.UpdateInternalParams();
+  fast_ground_detection_.ResetParameters(ground_detection_params_);
+}
 
 std::unique_ptr<carto::sensor::OdometryData> SensorBridge::ToOdometryData(
     const nav_msgs::Odometry::ConstPtr& msg) {
@@ -153,79 +161,40 @@ void SensorBridge::HandleImuMessage(const std::string& sensor_id,
   }
 }
 
-void SensorBridge::HandleLaserScanMessage(
-    const std::string& sensor_id, const sensor_msgs::LaserScan::ConstPtr& msg) {
-  carto::sensor::PointCloudWithIntensities point_cloud;
-  carto::common::Time time;
-  std::tie(point_cloud, time) = ToPointCloudWithIntensities(*msg);
-  HandleLaserScan(sensor_id, time, msg->header.frame_id, point_cloud);
-}
-
-void SensorBridge::HandleMultiEchoLaserScanMessage(
-    const std::string& sensor_id,
-    const sensor_msgs::MultiEchoLaserScan::ConstPtr& msg) {
-  carto::sensor::PointCloudWithIntensities point_cloud;
-  carto::common::Time time;
-  std::tie(point_cloud, time) = ToPointCloudWithIntensities(*msg);
-  HandleLaserScan(sensor_id, time, msg->header.frame_id, point_cloud);
-}
-
 void SensorBridge::HandlePointCloud2Message(
     const std::string& sensor_id,
     const sensor_msgs::PointCloud2::ConstPtr& msg) {
   carto::sensor::PointCloudWithIntensities point_cloud;
   carto::common::Time time;
   std::tie(point_cloud, time) = ToPointCloudWithIntensities(*msg);
-  HandleRangefinder(sensor_id, time, msg->header.frame_id, point_cloud.points);
+
+  // wgh-- detect ground points, label them with intensity.
+  bool detect_ground = true;
+  if (detect_ground) {
+    std::vector<int> ground_labels;
+    float ground_distri_score = 0;
+    fast_ground_detection_.Segment(point_cloud, &ground_labels, 
+                                  ground_distri_score, true);
+    ground_labelled_point_cloud = ToPointCloud2Message(
+                                    carto::common::ToUniversal(time), 
+                                    msg->header.frame_id, 
+                                    point_cloud);
+    ground_labelled_point_cloud.header = msg->header;
+  }
+
+  HandleRangefinder(sensor_id, time, msg->header.frame_id, 
+                    point_cloud.points, point_cloud.intensities);
 }
 
 const TfBridge& SensorBridge::tf_bridge() const { return tf_bridge_; }
 
-void SensorBridge::HandleLaserScan(
-    const std::string& sensor_id, const carto::common::Time time,
-    const std::string& frame_id,
-    const carto::sensor::PointCloudWithIntensities& points) {
-  if (points.points.empty()) {
-    return;
-  }
-  CHECK_LE(points.points.back().time, 0.f);
-  // TODO(gaschler): Use per-point time instead of subdivisions.
-  for (int i = 0; i != num_subdivisions_per_laser_scan_; ++i) {
-    const size_t start_index =
-        points.points.size() * i / num_subdivisions_per_laser_scan_;
-    const size_t end_index =
-        points.points.size() * (i + 1) / num_subdivisions_per_laser_scan_;
-    carto::sensor::TimedPointCloud subdivision(
-        points.points.begin() + start_index, points.points.begin() + end_index);
-    if (start_index == end_index) {
-      continue;
-    }
-    const double time_to_subdivision_end = subdivision.back().time;
-    // `subdivision_time` is the end of the measurement so sensor::Collator will
-    // send all other sensor data first.
-    const carto::common::Time subdivision_time =
-        time + carto::common::FromSeconds(time_to_subdivision_end);
-    auto it = sensor_to_previous_subdivision_time_.find(sensor_id);
-    if (it != sensor_to_previous_subdivision_time_.end() &&
-        it->second >= subdivision_time) {
-      LOG(WARNING) << "Ignored subdivision of a LaserScan message from sensor "
-                   << sensor_id << " because previous subdivision time "
-                   << it->second << " is not before current subdivision time "
-                   << subdivision_time;
-      continue;
-    }
-    sensor_to_previous_subdivision_time_[sensor_id] = subdivision_time;
-    for (auto& point : subdivision) {
-      point.time -= time_to_subdivision_end;
-    }
-    CHECK_EQ(subdivision.back().time, 0.f);
-    HandleRangefinder(sensor_id, subdivision_time, frame_id, subdivision);
-  }
-}
+const sensor_msgs::PointCloud2& SensorBridge::GetGroundLabelledPointCloud()
+{return ground_labelled_point_cloud;}
 
 void SensorBridge::HandleRangefinder(
     const std::string& sensor_id, const carto::common::Time time,
-    const std::string& frame_id, const carto::sensor::TimedPointCloud& ranges) {
+    const std::string& frame_id, const carto::sensor::TimedPointCloud& ranges,
+    const std::vector<float>& intensities) {
   if (!ranges.empty()) {
     CHECK_LE(ranges.back().time, 0.f);
   }
@@ -234,9 +203,11 @@ void SensorBridge::HandleRangefinder(
   if (sensor_to_tracking != nullptr) {
     trajectory_builder_->AddSensorData(
         sensor_id, carto::sensor::TimedPointCloudData{
-                       time, sensor_to_tracking->translation().cast<float>(),
+                       time, 
+                       sensor_to_tracking->translation().cast<float>(),
                        carto::sensor::TransformTimedPointCloud(
-                           ranges, sensor_to_tracking->cast<float>())});
+                           ranges, sensor_to_tracking->cast<float>()),
+                       intensities});
   }
 }
 

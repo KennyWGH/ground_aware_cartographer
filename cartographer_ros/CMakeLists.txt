@@ -44,12 +44,31 @@ endif()
 find_package(Boost REQUIRED COMPONENTS system iostreams)
 find_package(PCL REQUIRED COMPONENTS common)
 
+if(${USE_THIRDPARTY_CARTOGRAPHER}) 
+  message(STATUS "************************************************************************* ")
+  message(STATUS "***************** Going to use thirdparty cartographer! ***************** ")
+  message(STATUS "************************************************************************* ")
+  string(REGEX REPLACE "(.*)/(.*)" "\\1" CMAKE_PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+  message(STATUS "CMAKE PARENT DIR: ${CMAKE_PARENT_DIR}")
+  set(cartographer_DIR ${CMAKE_PARENT_DIR}/cartographer/share/cartographer)
+  message(STATUS "cartographer DIR: ${cartographer_DIR}")
+  message(STATUS "************************************************************************* ")
+endif()
+
+# option(BUILD_GRPC "build features that require Cartographer gRPC support" false)
+# include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/functions_for_cartographer_ros.cmake")
+# google_initialize_cartographer_ros_project()
+
 find_package(cartographer REQUIRED)
 include("${CARTOGRAPHER_CMAKE_DIR}/functions.cmake")
 option(BUILD_GRPC "build features that require Cartographer gRPC support" false)
 google_initialize_cartographer_project()
-google_enable_testing()
-set(CARTOGRAPHER_GMOCK_LIBRARIES ${GMOCK_LIBRARIES})
+
+if(${cartographer_FOUND})
+  message(STATUS "########################")
+  message(STATUS "Found cartographer dir: ${cartographer_DIR}")
+  message(STATUS "########################")
+endif()
 
 find_package(catkin REQUIRED COMPONENTS ${PACKAGE_DEPENDENCIES})
 
@@ -69,11 +88,6 @@ endif()
 include_directories(
   ${urdfdom_headers_INCLUDE_DIRS}
 )
-
-# Override Catkin's GTest configuration to use GMock.
-set(GTEST_FOUND TRUE)
-set(GTEST_INCLUDE_DIRS ${GMOCK_INCLUDE_DIRS})
-set(GTEST_LIBRARIES ${CARTOGRAPHER_GMOCK_LIBRARIES})
 
 catkin_package(
   CATKIN_DEPENDS
@@ -147,28 +161,6 @@ set(TARGET_COMPILE_FLAGS "${TARGET_COMPILE_FLAGS} ${GOOG_CXX_FLAGS}")
 set_target_properties(${PROJECT_NAME} PROPERTIES
   COMPILE_FLAGS ${TARGET_COMPILE_FLAGS})
 
-if (CATKIN_ENABLE_TESTING)
-  foreach(TEST_SOURCE_FILENAME ${ALL_TESTS})
-    get_filename_component(TEST_NAME ${TEST_SOURCE_FILENAME} NAME_WE)
-    catkin_add_gtest(${TEST_NAME} ${TEST_SOURCE_FILENAME})
-    # catkin_add_gtest uses a plain (i.e. no PUBLIC/PRIVATE/INTERFACE) call to
-    # target_link_libraries. That forces us to do the same.
-    target_link_libraries(${TEST_NAME} ${GMOCK_LIBRARIES} ${GTEST_MAIN_LIBRARIES})
-    target_include_directories(${TEST_NAME} SYSTEM PUBLIC ${LUA_INCLUDE_DIR})
-    target_link_libraries(${TEST_NAME} ${LUA_LIBRARIES})
-    target_include_directories(${TEST_NAME} SYSTEM PUBLIC ${catkin_INCLUDE_DIRS})
-    target_link_libraries(${TEST_NAME} ${catkin_LIBRARIES})
-    add_dependencies(${TEST_NAME} ${catkin_EXPORTED_TARGETS})
-    target_link_libraries(${TEST_NAME} cartographer)
-    target_link_libraries(${TEST_NAME} ${PROJECT_NAME})
-    set_target_properties(${TEST_NAME} PROPERTIES COMPILE_FLAGS ${TARGET_COMPILE_FLAGS})
-    # Needed for dynamically linked GTest on Windows.
-    if (WIN32)
-      target_compile_definitions(${TEST_NAME} PUBLIC -DGTEST_LINKED_AS_SHARED_LIBRARY)
-    endif()
-  endforeach()
-endif()
-
 install(DIRECTORY launch urdf configuration_files
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
@@ -195,3 +187,21 @@ foreach(HDR ${HDRS})
       include/${INSTALL_DIR}
   )
 endforeach()
+
+# 如果使用第三方cartographer库，需要单独安装该库的配置文件。
+if(${USE_THIRDPARTY_CARTOGRAPHER}) 
+  message(STATUS "************************************************************************* ")
+  message(STATUS "************ installing thirdparty cartographer config files! *********** ")
+  message(STATUS "************************************************************************* ")
+  message(STATUS "cmake curr source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
+  message(STATUS "cmake install prefix: ${CMAKE_INSTALL_PREFIX}")
+  if(NOT CMAKE_PARENT_DIR)
+    string(REGEX REPLACE "(.*)/(.*)" "\\1" CMAKE_PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+    message(STATUS "CMAKE PARENT DIR: ${CMAKE_PARENT_DIR}")
+  endif()
+  set(CARTO_CONFIG_FILES_DIR ${CMAKE_PARENT_DIR}/cartographer/share/cartographer/configuration_files)
+  # set(CARTO_CONFIG_FILES_DIR ${CMAKE_PARENT_DIR}/cartographer_rviz/ogre_media/materials/glsl120)
+  message(STATUS "config files dir: ${CARTO_CONFIG_FILES_DIR}")
+  install(DIRECTORY ${CARTO_CONFIG_FILES_DIR} DESTINATION share/cartographer/)
+  message(STATUS "************************************************************************* ")
+endif()

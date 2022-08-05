@@ -21,6 +21,10 @@
 
   <node name="rviz" pkg="rviz" type="rviz" required="true"
       args="-d $(find cartographer_ros)/configuration_files/demo_3d.rviz" />
+
+  <!-- Google Dataset -->
+  <arg name="bag_filename" default="/mnt/ubuntu_disk/Downloads/b3-2016-04-05-14-14-00.bag"/>
+
   <node name="playbag" pkg="rosbag" type="play"
-      args="--clock $(arg bag_filename)" />
+      args="--clock -s 0 -r 0.6 $(arg bag_filename)" />
 </launch>

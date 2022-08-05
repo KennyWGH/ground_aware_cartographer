@@ -31,11 +31,14 @@
 #include "geometry_msgs/TransformStamped.h"
 #include "nav_msgs/OccupancyGrid.h"
 #include "nav_msgs/Odometry.h"
+#include "std_msgs/Header.h"
 #include "sensor_msgs/Imu.h"
 #include "sensor_msgs/LaserScan.h"
 #include "sensor_msgs/MultiEchoLaserScan.h"
 #include "sensor_msgs/NavSatFix.h"
 #include "sensor_msgs/PointCloud2.h"
+
+#include "cartographer_ros/fast_ground_detection/fast_ground_detection.h"
 
 namespace cartographer_ros {
 
@@ -45,7 +48,8 @@ class SensorBridge {
   explicit SensorBridge(
       int num_subdivisions_per_laser_scan, const std::string& tracking_frame,
       double lookup_transform_timeout_sec, tf2_ros::Buffer* tf_buffer,
-      ::cartographer::mapping::TrajectoryBuilderInterface* trajectory_builder);
+      ::cartographer::mapping::TrajectoryBuilderInterface* trajectory_builder,
+      float ground_detection_param = 0 /*future TODO*/ );
 
   SensorBridge(const SensorBridge&) = delete;
   SensorBridge& operator=(const SensorBridge&) = delete;
@@ -64,25 +68,20 @@ class SensorBridge {
       const sensor_msgs::Imu::ConstPtr& msg);
   void HandleImuMessage(const std::string& sensor_id,
                         const sensor_msgs::Imu::ConstPtr& msg);
-  void HandleLaserScanMessage(const std::string& sensor_id,
-                              const sensor_msgs::LaserScan::ConstPtr& msg);
-  void HandleMultiEchoLaserScanMessage(
-      const std::string& sensor_id,
-      const sensor_msgs::MultiEchoLaserScan::ConstPtr& msg);
   void HandlePointCloud2Message(const std::string& sensor_id,
                                 const sensor_msgs::PointCloud2::ConstPtr& msg);
 
   const TfBridge& tf_bridge() const;
 
+  // wgh-- ground detection (output labelled cloud).
+  const sensor_msgs::PointCloud2& GetGroundLabelledPointCloud();
+
  private:
-  void HandleLaserScan(
-      const std::string& sensor_id, ::cartographer::common::Time start_time,
-      const std::string& frame_id,
-      const ::cartographer::sensor::PointCloudWithIntensities& points);
   void HandleRangefinder(const std::string& sensor_id,
                          ::cartographer::common::Time time,
                          const std::string& frame_id,
-                         const ::cartographer::sensor::TimedPointCloud& ranges);
+                         const ::cartographer::sensor::TimedPointCloud& ranges,
+                         const std::vector<float>& intensities);
 
   const int num_subdivisions_per_laser_scan_;
   std::map<std::string, cartographer::common::Time>
@@ -92,6 +91,11 @@ class SensorBridge {
       trajectory_builder_;
 
   absl::optional<::cartographer::transform::Rigid3d> ecef_to_local_frame_;
+
+  // wgh-- ground detection.
+  DetectionParams ground_detection_params_;
+  FastGroundDetection fast_ground_detection_;
+  sensor_msgs::PointCloud2 ground_labelled_point_cloud;
 };
 
 }  // namespace cartographer_ros

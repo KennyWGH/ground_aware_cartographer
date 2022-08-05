@@ -25,6 +25,8 @@
 #include "cartographer_ros_msgs/StatusCode.h"
 #include "cartographer_ros_msgs/StatusResponse.h"
 
+#include "cartographer/sensor/internal/voxel_filter.h" // wgh--
+
 namespace cartographer_ros {
 namespace {
 
@@ -51,7 +53,11 @@ visualization_msgs::Marker CreateTrajectoryMarker(const int trajectory_id,
   marker.type = visualization_msgs::Marker::LINE_STRIP;
   marker.header.stamp = ::ros::Time::now();
   marker.header.frame_id = frame_id;
-  marker.color = ToMessage(cartographer::io::GetColor(trajectory_id));
+  // marker.color = ToMessage(cartographer::io::GetColor(trajectory_id));
+  marker.color.r = 1.0;
+  marker.color.g = 1.0;
+  marker.color.b = 0.0;
+  marker.color.a = 1.0;
   marker.scale.x = kTrajectoryLineStripMarkerScale;
   marker.pose.orientation.w = 1.;
   marker.pose.position.z = 0.05;
@@ -94,15 +100,74 @@ void PushAndResetLineMarker(visualization_msgs::Marker* marker,
   marker->points.clear();
 }
 
+// wgh 新添加的函数，将::cartographer::sensor::PointCloud转化为含intensity的ROS消息
+sensor_msgs::PointCloud2 FromCartoPointCloud2RosPointCloud2 (
+  const ::cartographer::sensor::PointCloud& point_cloud)
+{
+  uint32_t num_points = point_cloud.size();
+  sensor_msgs::PointCloud2 msg;
+  msg.height = 1;
+  msg.width = num_points;
+  msg.fields.resize(4);
+  msg.fields[0].name = "x";
+  msg.fields[0].offset = 0;
+  msg.fields[0].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[0].count = 1;
+  msg.fields[1].name = "y";
+  msg.fields[1].offset = 4;
+  msg.fields[1].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[1].count = 1;
+  msg.fields[2].name = "z";
+  msg.fields[2].offset = 8;
+  msg.fields[2].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[2].count = 1;
+  msg.fields[3].name = "intensity";
+  msg.fields[3].offset = 12;
+  msg.fields[3].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[3].count = 1;
+  msg.is_bigendian = false;
+  msg.point_step = 16;
+  msg.row_step = 16 * msg.width;
+  msg.is_dense = true;
+  msg.data.resize(16 * num_points);
+
+  ::ros::serialization::OStream stream(msg.data.data(), msg.data.size());
+  const auto& cloud_data = point_cloud.points();
+  const auto& intensities_data = point_cloud.intensities();
+  if (intensities_data.size() != cloud_data.size()) {
+    for (std::size_t i=0; i<cloud_data.size(); ++i) {
+      stream.next(cloud_data[i].position.x());
+      stream.next(cloud_data[i].position.y());
+      stream.next(cloud_data[i].position.z());
+      stream.next(0);
+    }
+    LOG(ERROR) << "Can't read intensity from scan_matched_point_cloud!";
+    return msg;
+  }
+  for (std::size_t i=0; i<cloud_data.size(); ++i) {
+    stream.next(cloud_data[i].position.x());
+    stream.next(cloud_data[i].position.y());
+    stream.next(cloud_data[i].position.z());
+    stream.next(intensities_data[i]);
+  }
+  return msg;
+}
+
 }  // namespace
 
 MapBuilderBridge::MapBuilderBridge(
     const NodeOptions& node_options,
-    std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder,
+    std::unique_ptr<cartographer::mapping::MapBuilder> map_builder,
     tf2_ros::Buffer* const tf_buffer)
     : node_options_(node_options),
       map_builder_(std::move(map_builder)),
       tf_buffer_(tf_buffer) {}
+
+void MapBuilderBridge::SetNodeHandleAndRegisterPublishers(
+    ::ros::NodeHandle* node_handle)
+{
+  node_handle_ = node_handle;
+}
 
 void MapBuilderBridge::LoadState(const std::string& state_filename,
                                  bool load_frozen_state) {
@@ -123,14 +188,17 @@ int MapBuilderBridge::AddTrajectory(
         expected_sensor_ids,
     const TrajectoryOptions& trajectory_options) {
   const int trajectory_id = map_builder_->AddTrajectoryBuilder(
-      expected_sensor_ids, trajectory_options.trajectory_builder_options,
+      expected_sensor_ids, 
+      trajectory_options.trajectory_builder_options,
       [this](const int trajectory_id, const ::cartographer::common::Time time,
              const Rigid3d local_pose,
              ::cartographer::sensor::RangeData range_data_in_local,
+             std::shared_ptr<::cartographer::sensor::PointCloud> local_ground_map,
              const std::unique_ptr<
                  const ::cartographer::mapping::TrajectoryBuilderInterface::
                      InsertionResult>) {
-        OnLocalSlamResult(trajectory_id, time, local_pose, range_data_in_local);
+        OnLocalSlamResult(trajectory_id, time, local_pose, 
+                          range_data_in_local, local_ground_map);
       });
   LOG(INFO) << "Added trajectory with ID '" << trajectory_id << "'.";
 
@@ -230,7 +298,8 @@ cartographer_ros_msgs::SubmapList MapBuilderBridge::GetSubmapList() {
 }
 
 std::unordered_map<int, MapBuilderBridge::LocalTrajectoryData>
-MapBuilderBridge::GetLocalTrajectoryData() {
+MapBuilderBridge::GetLocalTrajectoryData() 
+{
   std::unordered_map<int, LocalTrajectoryData> local_trajectory_data;
   for (const auto& entry : sensor_bridges_) {
     const int trajectory_id = entry.first;
@@ -282,7 +351,9 @@ void MapBuilderBridge::HandleTrajectoryQuery(
       " trajectory nodes from trajectory ", request.trajectory_id, ".");
 }
 
-visualization_msgs::MarkerArray MapBuilderBridge::GetTrajectoryNodeList() {
+// wgh-- 发布轨迹的地方，改版之。
+visualization_msgs::MarkerArray MapBuilderBridge::GetTrajectoryNodeList() 
+{
   visualization_msgs::MarkerArray trajectory_node_list;
   const auto node_poses = map_builder_->pose_graph()->GetTrajectoryNodePoses();
   // Find the last node indices for each trajectory that have either
@@ -298,15 +369,21 @@ visualization_msgs::MarkerArray MapBuilderBridge::GetTrajectoryNodeList() {
   const auto constraints = map_builder_->pose_graph()->constraints();
   for (const auto& constraint : constraints) {
     if (constraint.tag ==
-        cartographer::mapping::PoseGraphInterface::Constraint::INTER_SUBMAP) {
+        cartographer::mapping::PoseGraphInterface::Constraint::INTER_SUBMAP) 
+    {
+      // wgh-- 同一条轨迹的INTER约束（找出node_id最大的约束）
       if (constraint.node_id.trajectory_id ==
-          constraint.submap_id.trajectory_id) {
-        trajectory_to_last_inter_submap_constrained_node[constraint.node_id
-                                                             .trajectory_id] =
-            std::max(trajectory_to_last_inter_submap_constrained_node.at(
-                         constraint.node_id.trajectory_id),
-                     constraint.node_id.node_index);
-      } else {
+          constraint.submap_id.trajectory_id) 
+      {
+        trajectory_to_last_inter_submap_constrained_node
+            [constraint.node_id.trajectory_id] =
+                std::max(trajectory_to_last_inter_submap_constrained_node.at(
+                            constraint.node_id.trajectory_id),
+                        constraint.node_id.node_index);
+      } 
+      // wgh-- 不同轨迹的INTER约束（找出node_id最大的约束）
+      else
+      {
         trajectory_to_last_inter_trajectory_constrained_node
             [constraint.node_id.trajectory_id] =
                 std::max(trajectory_to_last_inter_submap_constrained_node.at(
@@ -316,9 +393,10 @@ visualization_msgs::MarkerArray MapBuilderBridge::GetTrajectoryNodeList() {
     }
   }
 
+  // wgh-- 一级遍历（遍历每条轨迹）
   for (const int trajectory_id : node_poses.trajectory_ids()) {
     visualization_msgs::Marker marker =
-        CreateTrajectoryMarker(trajectory_id, node_options_.map_frame);
+        CreateTrajectoryMarker(trajectory_id, node_options_.map_frame); // 规定了frame_id/color/scale等信息。
     int last_inter_submap_constrained_node = std::max(
         node_poses.trajectory(trajectory_id).begin()->id.node_index,
         trajectory_to_last_inter_submap_constrained_node.at(trajectory_id));
@@ -350,12 +428,14 @@ visualization_msgs::MarkerArray MapBuilderBridge::GetTrajectoryNodeList() {
           last_inter_trajectory_constrained_node) {
         PushAndResetLineMarker(&marker, &trajectory_node_list.markers);
         marker.points.push_back(node_point);
-        marker.color.a = 0.5;
+        // marker.color.a = 0.5;
+        marker.color.a = 1.;
       }
       if (node_id_data.id.node_index == last_inter_submap_constrained_node) {
         PushAndResetLineMarker(&marker, &trajectory_node_list.markers);
         marker.points.push_back(node_point);
-        marker.color.a = 0.25;
+        // marker.color.a = 0.25;
+        marker.color.a = 1.;
       }
       // Work around the 16384 point limit in RViz by splitting the
       // trajectory into multiple markers.
@@ -519,18 +599,142 @@ visualization_msgs::MarkerArray MapBuilderBridge::GetConstraintList() {
   return constraint_list;
 }
 
+// wgh-- Generate global map point cloud in ROS::PointCloud2.
+// wgh-- A versatile strategy has been used to control point cloud size.
+const sensor_msgs::PointCloud2& 
+MapBuilderBridge::GetGlobalMapOfTrajectoryZero()
+{
+  using ::cartographer::transform::Rigid3d;
+  using ::cartographer::mapping::MapById;
+  using ::cartographer::mapping::NodeId;
+  using ::cartographer::mapping::TrajectoryNode;
+  using ::cartographer::sensor::RangefinderPoint;
+
+  // wgh-- Let's begin.
+  constexpr int trajectory_id = 0;
+  const auto& trajectory_nodes = map_builder_->pose_graph()->GetTrajectoryNodes();
+  size_t traj_nodes_size_now = trajectory_nodes.SizeOfTrajectoryOrZero(trajectory_id);
+  if (traj_nodes_size_now == 0) {
+    LOG(WARNING) << "No nodes exist for trajectory " << trajectory_id << ".";
+    return global_map_ros;
+  }
+  if (traj_nodes_size_last_pub == traj_nodes_size_now) {
+    return global_map_ros;
+  }
+  traj_nodes_size_last_pub = traj_nodes_size_now;
+  if (!check_trajectory_status_once) {
+    check_trajectory_status_once = true;
+    auto node_it = trajectory_nodes.BeginOfTrajectory(trajectory_id);
+    auto& node_begin = trajectory_nodes.at(node_it->id);
+    if (node_begin.constant_data == nullptr) {
+      LOG(WARNING) << "node constant_data is nullptr, might be an empty trajectory!";
+    }
+    else {
+      auto& node_point_cloud = node_begin.constant_data->low_resolution_point_cloud;
+      if (node_point_cloud.size() == 0) {
+        LOG(WARNING) << "empty point cloud for node data, might be an empty trajectory.";
+      }
+      if (node_point_cloud.intensities().size() == 0) {
+        LOG(WARNING) << "point cloud has no intensity info, might be a loaded trajectory.";
+      }
+    }
+  }
+  // wgh-- Let's get the global map.
+  std::vector<RangefinderPoint> global_map_points;
+  std::vector<float> global_map_intensities;
+  std::vector<RangefinderPoint> temp_submap_points;
+  std::vector<float> temp_submap_intensities;
+  std::size_t temp_submap_size = 0;
+  // 遍历轨迹的所有节点(注意，每400个节点汇聚为一个submap，对submap地图降采样，以降低总体点云规模！)
+  // 当节点规模过大时(超过2000)，将所有节点分为5份，按5个submap处理。
+  // 达到的效果是：无论有多少个node，我们至多允许5个submap。
+  std::size_t submap_size_limit = traj_nodes_size_now < 2000 
+                                    ? 400 : (traj_nodes_size_now / 5);
+  std::size_t skip_once_every_n_nodes = traj_nodes_size_now < 2000 
+                                          ? 10 
+                                          : (traj_nodes_size_now < 4000
+                                              ? 5
+                                              : 2);
+  std::size_t curr_node_index = 0;
+  auto node_it = trajectory_nodes.BeginOfTrajectory(trajectory_id);
+  auto node_end = trajectory_nodes.EndOfTrajectory(trajectory_id);
+  for (; node_it != node_end; ++node_it) {
+    curr_node_index++;
+    if (curr_node_index % skip_once_every_n_nodes == 0) continue;
+    auto& trajectory_node = trajectory_nodes.at(node_it->id);
+    if (trajectory_node.constant_data == nullptr) continue;
+    auto& node_point_cloud = trajectory_node.constant_data->low_resolution_point_cloud;
+    auto& global_pose = trajectory_node.global_pose;
+    auto& points = node_point_cloud.points();
+    auto& intensities = node_point_cloud.intensities();
+    bool assign_intensity = (points.size() != 0) && (points.size() != intensities.size());
+    if (points.size() != 0) 
+    {
+      temp_submap_size++;
+      for (std::size_t i=0; i<points.size(); i++) {
+        temp_submap_points.push_back(global_pose.cast<float>() * points[i]);
+        temp_submap_intensities.push_back(assign_intensity ? 10.f : intensities[i]);
+      }
+      if (temp_submap_size == submap_size_limit) {
+        auto filtered_temp_submap = ::cartographer::sensor::VoxelFilter(
+          ::cartographer::sensor::PointCloud(temp_submap_points,temp_submap_intensities), 
+          0.2);
+        const auto& filtered_submap_points = filtered_temp_submap.points();
+        const auto& filtered_submap_intensities = filtered_temp_submap.intensities();
+        if (filtered_submap_points.size() == filtered_submap_intensities.size()) {
+          global_map_points.insert(global_map_points.end(), 
+              filtered_submap_points.begin(), filtered_submap_points.end());
+          global_map_intensities.insert(global_map_intensities.end(),
+              filtered_submap_intensities.begin(), filtered_submap_intensities.end());
+        }
+        // reset temp submap.
+        temp_submap_size = 0;
+        temp_submap_points.clear();
+        temp_submap_intensities.clear();
+      }
+    }
+  }
+  // make sure you dont miss the last 'incomplete' submap!
+  if (temp_submap_size > 0) {
+    auto filtered_temp_submap = ::cartographer::sensor::VoxelFilter(
+      ::cartographer::sensor::PointCloud(temp_submap_points,temp_submap_intensities), 
+      0.15);
+    const auto& filtered_submap_points = filtered_temp_submap.points();
+    const auto& filtered_submap_intensities = filtered_temp_submap.intensities();
+    if (filtered_submap_points.size() == filtered_submap_intensities.size()) {
+      global_map_points.insert(global_map_points.end(), 
+          filtered_submap_points.begin(), filtered_submap_points.end());
+      global_map_intensities.insert(global_map_intensities.end(),
+          filtered_submap_intensities.begin(), filtered_submap_intensities.end());
+    }
+  }
+  ::cartographer::sensor::PointCloud global_map(global_map_points, global_map_intensities);
+  LOG(INFO) << "global map (trajectory " << trajectory_id << "): " 
+            << traj_nodes_size_now << " nodes, "
+            << global_map_points.size() << " points.";
+  global_map_ros = FromCartoPointCloud2RosPointCloud2(global_map);
+  global_map_ros.header.stamp = ros::Time::now();
+  global_map_ros.header.frame_id = node_options_.map_frame;
+  return global_map_ros;
+}
+
 SensorBridge* MapBuilderBridge::sensor_bridge(const int trajectory_id) {
   return sensor_bridges_.at(trajectory_id).get();
 }
 
 void MapBuilderBridge::OnLocalSlamResult(
-    const int trajectory_id, const ::cartographer::common::Time time,
+    const int trajectory_id, 
+    const ::cartographer::common::Time time,
     const Rigid3d local_pose,
-    ::cartographer::sensor::RangeData range_data_in_local) {
+    ::cartographer::sensor::RangeData range_data_in_local,
+    std::shared_ptr<::cartographer::sensor::PointCloud> local_ground_map) 
+{
   std::shared_ptr<const LocalTrajectoryData::LocalSlamData> local_slam_data =
       std::make_shared<LocalTrajectoryData::LocalSlamData>(
-          LocalTrajectoryData::LocalSlamData{time, local_pose,
-                                             std::move(range_data_in_local)});
+          LocalTrajectoryData::LocalSlamData{time,
+                                             local_pose,
+                                             std::move(range_data_in_local),
+                                             local_ground_map});
   absl::MutexLock lock(&mutex_);
   local_slam_data_[trajectory_id] = std::move(local_slam_data);
 }

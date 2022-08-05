@@ -24,6 +24,7 @@
 
 #include "absl/synchronization/mutex.h"
 #include "cartographer/mapping/map_builder_interface.h"
+#include "cartographer/mapping/map_builder.h"
 #include "cartographer/mapping/pose_graph_interface.h"
 #include "cartographer/mapping/proto/trajectory_builder_options.pb.h"
 #include "cartographer/mapping/trajectory_builder_interface.h"
@@ -37,6 +38,7 @@
 #include "cartographer_ros_msgs/TrajectoryQuery.h"
 #include "geometry_msgs/TransformStamped.h"
 #include "nav_msgs/OccupancyGrid.h"
+#include "sensor_msgs/PointCloud2.h"
 
 // Abseil unfortunately pulls in winnt.h, which #defines DELETE.
 // Clean up to unbreak visualization_msgs::Marker::DELETE.
@@ -57,6 +59,7 @@ class MapBuilderBridge {
       ::cartographer::common::Time time;
       ::cartographer::transform::Rigid3d local_pose;
       ::cartographer::sensor::RangeData range_data_in_local;
+      std::shared_ptr<::cartographer::sensor::PointCloud> local_ground_map;
     };
     std::shared_ptr<const LocalSlamData> local_slam_data;
     cartographer::transform::Rigid3d local_to_map;
@@ -66,11 +69,13 @@ class MapBuilderBridge {
 
   MapBuilderBridge(
       const NodeOptions& node_options,
-      std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder,
+      std::unique_ptr<cartographer::mapping::MapBuilder> map_builder,
       tf2_ros::Buffer* tf_buffer);
 
   MapBuilderBridge(const MapBuilderBridge&) = delete;
   MapBuilderBridge& operator=(const MapBuilderBridge&) = delete;
+
+  void SetNodeHandleAndRegisterPublishers(::ros::NodeHandle* node_handle);
 
   void LoadState(const std::string& state_filename, bool load_frozen_state);
   int AddTrajectory(
@@ -100,21 +105,31 @@ class MapBuilderBridge {
   visualization_msgs::MarkerArray GetLandmarkPosesList();
   visualization_msgs::MarkerArray GetConstraintList();
 
+  const sensor_msgs::PointCloud2& GetGlobalMapOfTrajectoryZero();
+
   SensorBridge* sensor_bridge(int trajectory_id);
 
  private:
   void OnLocalSlamResult(const int trajectory_id,
                          const ::cartographer::common::Time time,
                          const ::cartographer::transform::Rigid3d local_pose,
-                         ::cartographer::sensor::RangeData range_data_in_local)
+                         ::cartographer::sensor::RangeData range_data_in_local,
+                         std::shared_ptr<::cartographer::sensor::PointCloud> local_ground_map)
       LOCKS_EXCLUDED(mutex_);
 
+//   void OnGlobalSlamResult(const int trajectory_id,
+//                          const ::cartographer::common::Time time,
+//                          const ::cartographer::transform::Rigid3d local_pose,
+//                          ::cartographer::sensor::RangeData range_data_in_local)
+//       LOCKS_EXCLUDED(mutex2_);
+
   absl::Mutex mutex_;
+  absl::Mutex mutex2_;  // wgh-- for global slam result callback. [Future TODO]
   const NodeOptions node_options_;
   std::unordered_map<int,
                      std::shared_ptr<const LocalTrajectoryData::LocalSlamData>>
       local_slam_data_ GUARDED_BY(mutex_);
-  std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder_;
+  std::unique_ptr<cartographer::mapping::MapBuilder> map_builder_;
   tf2_ros::Buffer* const tf_buffer_;
 
   std::unordered_map<std::string /* landmark ID */, int> landmark_to_index_;
@@ -123,6 +138,19 @@ class MapBuilderBridge {
   std::unordered_map<int, TrajectoryOptions> trajectory_options_;
   std::unordered_map<int, std::unique_ptr<SensorBridge>> sensor_bridges_;
   std::unordered_map<int, size_t> trajectory_to_highest_marker_id_;
+
+  // wgh--
+  ::ros::NodeHandle* node_handle_;
+  // std::string topic_ground_cloud = "curr_scan_ground_points";
+  // ::ros::Publisher current_scan_ground_publisher_;
+  // ::ros::Publisher local_map_cloud_publisher_;
+  // ::ros::Publisher global_map_cloud_publisher_;
+  // ::ros::Publisher whatever_publisher_;
+
+  // wgh-- Generate global map point cloud in ROS::PointCloud2.
+  std::size_t traj_nodes_size_last_pub = 0;
+  sensor_msgs::PointCloud2 global_map_ros;
+  bool check_trajectory_status_once = false;
 };
 
 }  // namespace cartographer_ros

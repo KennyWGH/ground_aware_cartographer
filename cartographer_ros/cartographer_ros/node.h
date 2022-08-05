@@ -27,6 +27,7 @@
 #include "absl/synchronization/mutex.h"
 #include "cartographer/common/fixed_ratio_sampler.h"
 #include "cartographer/mapping/map_builder_interface.h"
+#include "cartographer/mapping/map_builder.h"
 #include "cartographer/mapping/pose_extrapolator.h"
 #include "cartographer_ros/map_builder_bridge.h"
 #include "cartographer_ros/metrics/family_factory.h"
@@ -50,6 +51,7 @@
 #include "sensor_msgs/NavSatFix.h"
 #include "sensor_msgs/PointCloud2.h"
 #include "tf2_ros/transform_broadcaster.h"
+#include "std_msgs/String.h"
 
 namespace cartographer_ros {
 
@@ -57,7 +59,7 @@ namespace cartographer_ros {
 class Node {
  public:
   Node(const NodeOptions& node_options,
-       std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder,
+       std::unique_ptr<cartographer::mapping::MapBuilder> map_builder,
        tf2_ros::Buffer* tf_buffer, bool collect_metrics);
   ~Node();
 
@@ -101,11 +103,6 @@ class Node {
       const cartographer_ros_msgs::LandmarkList::ConstPtr& msg);
   void HandleImuMessage(int trajectory_id, const std::string& sensor_id,
                         const sensor_msgs::Imu::ConstPtr& msg);
-  void HandleLaserScanMessage(int trajectory_id, const std::string& sensor_id,
-                              const sensor_msgs::LaserScan::ConstPtr& msg);
-  void HandleMultiEchoLaserScanMessage(
-      int trajectory_id, const std::string& sensor_id,
-      const sensor_msgs::MultiEchoLaserScan::ConstPtr& msg);
   void HandlePointCloud2Message(int trajectory_id, const std::string& sensor_id,
                                 const sensor_msgs::PointCloud2::ConstPtr& msg);
 
@@ -163,6 +160,7 @@ class Node {
   void PublishTrajectoryNodeList(const ::ros::WallTimerEvent& timer_event);
   void PublishLandmarkPosesList(const ::ros::WallTimerEvent& timer_event);
   void PublishConstraintList(const ::ros::WallTimerEvent& timer_event);
+  void PublishGlobalMapPointCloud(const ::ros::WallTimerEvent& timer_event);
   bool ValidateTrajectoryOptions(const TrajectoryOptions& options);
   bool ValidateTopicNames(const TrajectoryOptions& options);
   cartographer_ros_msgs::StatusResponse FinishTrajectoryUnderLock(
@@ -192,6 +190,12 @@ class Node {
   // These ros::ServiceServers need to live for the lifetime of the node.
   std::vector<::ros::ServiceServer> service_servers_;
   ::ros::Publisher scan_matched_point_cloud_publisher_;
+  ::ros::Publisher local_ground_map_point_cloud_publisher_;     // wgh--
+  ::ros::Publisher scan_ground_labelled_point_cloud_publisher_; // wgh--
+  ::ros::Publisher global_point_cloud_map_publisher_;           // wgh--
+  ::ros::Publisher slam_info_publisher_;                        // wgh--
+  ::ros::Publisher key_scan_publisher_;                         // wgh--
+  ::ros::Publisher ros_trajectory_publisher_;                   // wgh--
 
   struct TrajectorySensorSamplers {
     TrajectorySensorSamplers(const double rangefinder_sampling_ratio,

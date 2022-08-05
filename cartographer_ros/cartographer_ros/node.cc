@@ -19,6 +19,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <sstream>
 
 #include "Eigen/Core"
 #include "absl/memory/memory.h"
@@ -88,14 +89,68 @@ std::string TrajectoryStateToString(const TrajectoryState trajectory_state) {
   return "";
 }
 
+// wgh 新添加的函数，将::cartographer::sensor::PointCloud转化为含intensity的ROS消息
+sensor_msgs::PointCloud2 FromCartoPointCloud2RosPointCloud2 (
+  const ::cartographer::sensor::PointCloud& point_cloud)
+{
+  uint32_t num_points = point_cloud.size();
+  sensor_msgs::PointCloud2 msg;
+  msg.height = 1;
+  msg.width = num_points;
+  msg.fields.resize(4);
+  msg.fields[0].name = "x";
+  msg.fields[0].offset = 0;
+  msg.fields[0].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[0].count = 1;
+  msg.fields[1].name = "y";
+  msg.fields[1].offset = 4;
+  msg.fields[1].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[1].count = 1;
+  msg.fields[2].name = "z";
+  msg.fields[2].offset = 8;
+  msg.fields[2].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[2].count = 1;
+  msg.fields[3].name = "intensity";
+  msg.fields[3].offset = 12;
+  msg.fields[3].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[3].count = 1;
+  msg.is_bigendian = false;
+  msg.point_step = 16;
+  msg.row_step = 16 * msg.width;
+  msg.is_dense = true;
+  msg.data.resize(16 * num_points);
+
+  ::ros::serialization::OStream stream(msg.data.data(), msg.data.size());
+  const auto& cloud_data = point_cloud.points();
+  const auto& intensities_data = point_cloud.intensities();
+  if (intensities_data.size() != cloud_data.size()) {
+    for (std::size_t i=0; i<cloud_data.size(); ++i) {
+      stream.next(cloud_data[i].position.x());
+      stream.next(cloud_data[i].position.y());
+      stream.next(cloud_data[i].position.z());
+      stream.next(0);
+    }
+    LOG(ERROR) << "Can't read intensity from scan_matched_point_cloud!";
+    return msg;
+  }
+  for (std::size_t i=0; i<cloud_data.size(); ++i) {
+    stream.next(cloud_data[i].position.x());
+    stream.next(cloud_data[i].position.y());
+    stream.next(cloud_data[i].position.z());
+    stream.next(intensities_data[i]);
+  }
+  return msg;
+}
+
 }  // namespace
 
 Node::Node(
     const NodeOptions& node_options,
-    std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder,
+    std::unique_ptr<cartographer::mapping::MapBuilder> map_builder,
     tf2_ros::Buffer* const tf_buffer, const bool collect_metrics)
     : node_options_(node_options),
-      map_builder_bridge_(node_options_, std::move(map_builder), tf_buffer) {
+      map_builder_bridge_(node_options_, std::move(map_builder), tf_buffer) 
+{
   absl::MutexLock lock(&mutex_);
   if (collect_metrics) {
     metrics_registry_ = absl::make_unique<metrics::FamilyFactory>();
@@ -137,6 +192,23 @@ Node::Node(
   scan_matched_point_cloud_publisher_ =
       node_handle_.advertise<sensor_msgs::PointCloud2>(
           kScanMatchedPointCloudTopic, kLatestOnlyPublisherQueueSize);
+  // wgh-- Register new publishers.
+  local_ground_map_point_cloud_publisher_ =
+      node_handle_.advertise<sensor_msgs::PointCloud2>(
+          "local_ground_map", kLatestOnlyPublisherQueueSize);
+  scan_ground_labelled_point_cloud_publisher_ =
+      node_handle_.advertise<sensor_msgs::PointCloud2>(
+          "ground_labelled_cloud", kLatestOnlyPublisherQueueSize);
+  global_point_cloud_map_publisher_ =
+      node_handle_.advertise<sensor_msgs::PointCloud2>(
+          "global_map_point_cloud", kLatestOnlyPublisherQueueSize);
+  slam_info_publisher_ =
+      node_handle_.advertise<std_msgs::String>(
+          "slam_info", kLatestOnlyPublisherQueueSize);
+  key_scan_publisher_ =
+      node_handle_.advertise<sensor_msgs::PointCloud2>(
+          "slam_key_scan", kLatestOnlyPublisherQueueSize);
+  // ros_trajectory_publisher_
 
   wall_timers_.push_back(node_handle_.createWallTimer(
       ::ros::WallDuration(node_options_.submap_publish_period_sec),
@@ -155,6 +227,15 @@ Node::Node(
   wall_timers_.push_back(node_handle_.createWallTimer(
       ::ros::WallDuration(kConstraintPublishPeriodSec),
       &Node::PublishConstraintList, this));
+  // wgh-- Publish global map in point cloud (every 5 seconds).
+  if (node_options.map_builder_options.use_trajectory_builder_3d()) {
+    wall_timers_.push_back(node_handle_.createWallTimer(
+        ::ros::WallDuration(5.0),
+        &Node::PublishGlobalMapPointCloud, this));
+  }
+
+  // wgh-- support publish ros msg inside MapBuilderBridge entity.
+  map_builder_bridge_.SetNodeHandleAndRegisterPublishers(&node_handle_);
 }
 
 Node::~Node() { FinishAllTrajectories(); }
@@ -228,23 +309,26 @@ void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
     // We only publish a point cloud if it has changed. It is not needed at high
     // frequency, and republishing it would be computationally wasteful.
     if (trajectory_data.local_slam_data->time !=
-        extrapolator.GetLastPoseTime()) {
+        extrapolator.GetLastPoseTime()) 
+    {
       if (scan_matched_point_cloud_publisher_.getNumSubscribers() > 0) {
-        // TODO(gaschler): Consider using other message without time
-        // information.
-        carto::sensor::TimedPointCloud point_cloud;
-        point_cloud.reserve(trajectory_data.local_slam_data->range_data_in_local
-                                .returns.size());
-        for (const cartographer::sensor::RangefinderPoint point :
-             trajectory_data.local_slam_data->range_data_in_local.returns) {
-          point_cloud.push_back(cartographer::sensor::ToTimedRangefinderPoint(
-              point, 0.f /* time */));
+        // wgh-- 发布含intensities信息点云的代码实现(弃用了原版的不发布强度的代码)。
+        sensor_msgs::PointCloud2 msg = 
+            FromCartoPointCloud2RosPointCloud2(
+                trajectory_data.local_slam_data->range_data_in_local.returns);
+        msg.header.stamp = ToRos(trajectory_data.local_slam_data->time);
+        msg.header.frame_id = node_options_.map_frame;
+        scan_matched_point_cloud_publisher_.publish(msg);
+      }
+      if (local_ground_map_point_cloud_publisher_.getNumSubscribers() > 0) {
+        if (trajectory_data.local_slam_data->local_ground_map != nullptr) {
+          sensor_msgs::PointCloud2 msg = 
+              FromCartoPointCloud2RosPointCloud2(
+                  *trajectory_data.local_slam_data->local_ground_map);
+          msg.header.stamp = ToRos(trajectory_data.local_slam_data->time);
+          msg.header.frame_id = node_options_.map_frame;
+          local_ground_map_point_cloud_publisher_.publish(msg);
         }
-        scan_matched_point_cloud_publisher_.publish(ToPointCloud2Message(
-            carto::common::ToUniversal(trajectory_data.local_slam_data->time),
-            node_options_.map_frame,
-            carto::sensor::TransformTimedPointCloud(
-                point_cloud, trajectory_data.local_to_map.cast<float>())));
       }
       extrapolator.AddPose(trajectory_data.local_slam_data->time,
                            trajectory_data.local_slam_data->local_pose);
@@ -322,6 +406,30 @@ void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
         pose_msg.pose = ToGeometryMsgPose(tracking_to_map);
         tracked_pose_publisher_.publish(pose_msg);
       }
+
+      // wgh-- Publish slam info string.
+      std::stringstream sstream;
+      double pX = tracking_to_map.translation().x();
+      double pY = tracking_to_map.translation().y();
+      double pZ = tracking_to_map.translation().z();
+      // pX = 0.123456;
+      // pY = -0.123456;
+      // pZ = -4.567890;
+      if (pX<-1e4 || pX>1e4 || pY<-1e4 || pY>1e4 || pZ<-1e4 || pZ>1e4) {
+          // LOG_WARN("Warning! Robot position are too large, please check!");
+          sstream << "x(" << pX << "), y(" << pY << "), z(" << pZ << ") may be too large, warning!";
+      }
+      else {
+          sstream <<    "x(" << (pX>0?"":"-") << std::abs(int(pX)) 
+                             << "." <<  std::abs(int((pX-int(pX))*100))
+                  << "), y(" << (pY>0?"":"-") << std::abs(int(pY)) 
+                             << "." <<  std::abs(int((pY-int(pY))*100))
+                  << "), z(" << (pZ>0?"":"-") << std::abs(int(pZ)) 
+                             << "." <<  std::abs(int((pZ-int(pZ))*100)) << ")";
+      }
+      std_msgs::String str_msg;
+      str_msg.data = sstream.str();
+      slam_info_publisher_.publish(str_msg);
     }
   }
 }
@@ -352,20 +460,24 @@ void Node::PublishConstraintList(
   }
 }
 
+// wgh-- Publish global map in point cloud.
+void Node::PublishGlobalMapPointCloud(
+    const ::ros::WallTimerEvent& unused_timer_event) 
+{
+  if (global_point_cloud_map_publisher_.getNumSubscribers() > 0) {
+    // absl::MutexLock lock(&mutex_);
+    // constraint_list_publisher_.publish(map_builder_bridge_.GetConstraintList());
+    const auto& global_map_point_cloud = map_builder_bridge_.GetGlobalMapOfTrajectoryZero();
+    global_point_cloud_map_publisher_.publish(global_map_point_cloud);
+  }
+}
+
 std::set<cartographer::mapping::TrajectoryBuilderInterface::SensorId>
 Node::ComputeExpectedSensorIds(const TrajectoryOptions& options) const {
   using SensorId = cartographer::mapping::TrajectoryBuilderInterface::SensorId;
   using SensorType = SensorId::SensorType;
   std::set<SensorId> expected_topics;
-  // Subscribe to all laser scan, multi echo laser scan, and point cloud topics.
-  for (const std::string& topic :
-       ComputeRepeatedTopicNames(kLaserScanTopic, options.num_laser_scans)) {
-    expected_topics.insert(SensorId{SensorType::RANGE, topic});
-  }
-  for (const std::string& topic : ComputeRepeatedTopicNames(
-           kMultiEchoLaserScanTopic, options.num_multi_echo_laser_scans)) {
-    expected_topics.insert(SensorId{SensorType::RANGE, topic});
-  }
+  // Subscribe to all point cloud topics.
   for (const std::string& topic :
        ComputeRepeatedTopicNames(kPointCloud2Topic, options.num_point_clouds)) {
     expected_topics.insert(SensorId{SensorType::RANGE, topic});
@@ -412,23 +524,8 @@ int Node::AddTrajectory(const TrajectoryOptions& options) {
 }
 
 void Node::LaunchSubscribers(const TrajectoryOptions& options,
-                             const int trajectory_id) {
-  for (const std::string& topic :
-       ComputeRepeatedTopicNames(kLaserScanTopic, options.num_laser_scans)) {
-    subscribers_[trajectory_id].push_back(
-        {SubscribeWithHandler<sensor_msgs::LaserScan>(
-             &Node::HandleLaserScanMessage, trajectory_id, topic, &node_handle_,
-             this),
-         topic});
-  }
-  for (const std::string& topic : ComputeRepeatedTopicNames(
-           kMultiEchoLaserScanTopic, options.num_multi_echo_laser_scans)) {
-    subscribers_[trajectory_id].push_back(
-        {SubscribeWithHandler<sensor_msgs::MultiEchoLaserScan>(
-             &Node::HandleMultiEchoLaserScanMessage, trajectory_id, topic,
-             &node_handle_, this),
-         topic});
-  }
+                             const int trajectory_id) 
+{
   for (const std::string& topic :
        ComputeRepeatedTopicNames(kPointCloud2Topic, options.num_point_clouds)) {
     subscribers_[trajectory_id].push_back(
@@ -806,34 +903,24 @@ void Node::HandleImuMessage(const int trajectory_id,
   if (!sensor_samplers_.at(trajectory_id).imu_sampler.Pulse()) {
     return;
   }
+
+  // wgh: if msg frame_id starts with a '/', remove it.
+  sensor_msgs::Imu::Ptr msg_ptr(new sensor_msgs::Imu);
+  *msg_ptr = *msg;
+  std::string frame_id_ = msg->header.frame_id;
+  if(frame_id_.front()=='/'){
+    frame_id_.erase( std::remove(frame_id_.begin(), frame_id_.end(), '/'), frame_id_.end() );
+    msg_ptr->header.frame_id = frame_id_;
+  }
+
   auto sensor_bridge_ptr = map_builder_bridge_.sensor_bridge(trajectory_id);
-  auto imu_data_ptr = sensor_bridge_ptr->ToImuData(msg);
+  // auto imu_data_ptr = sensor_bridge_ptr->ToImuData(msg);
+  auto imu_data_ptr = sensor_bridge_ptr->ToImuData(msg_ptr);
   if (imu_data_ptr != nullptr) {
     extrapolators_.at(trajectory_id).AddImuData(*imu_data_ptr);
   }
-  sensor_bridge_ptr->HandleImuMessage(sensor_id, msg);
-}
-
-void Node::HandleLaserScanMessage(const int trajectory_id,
-                                  const std::string& sensor_id,
-                                  const sensor_msgs::LaserScan::ConstPtr& msg) {
-  absl::MutexLock lock(&mutex_);
-  if (!sensor_samplers_.at(trajectory_id).rangefinder_sampler.Pulse()) {
-    return;
-  }
-  map_builder_bridge_.sensor_bridge(trajectory_id)
-      ->HandleLaserScanMessage(sensor_id, msg);
-}
-
-void Node::HandleMultiEchoLaserScanMessage(
-    const int trajectory_id, const std::string& sensor_id,
-    const sensor_msgs::MultiEchoLaserScan::ConstPtr& msg) {
-  absl::MutexLock lock(&mutex_);
-  if (!sensor_samplers_.at(trajectory_id).rangefinder_sampler.Pulse()) {
-    return;
-  }
-  map_builder_bridge_.sensor_bridge(trajectory_id)
-      ->HandleMultiEchoLaserScanMessage(sensor_id, msg);
+  // sensor_bridge_ptr->HandleImuMessage(sensor_id, msg);
+  sensor_bridge_ptr->HandleImuMessage(sensor_id, msg_ptr);
 }
 
 void Node::HandlePointCloud2Message(
@@ -845,6 +932,14 @@ void Node::HandlePointCloud2Message(
   }
   map_builder_bridge_.sensor_bridge(trajectory_id)
       ->HandlePointCloud2Message(sensor_id, msg);
+
+  // SensorBridge is responsible for detect and label ground points, you can 
+  // get ground-labelled point cloud from SensorBridge when necessary.
+  if (scan_ground_labelled_point_cloud_publisher_.getNumSubscribers() > 0) {
+    scan_ground_labelled_point_cloud_publisher_.publish(
+      map_builder_bridge_.
+        sensor_bridge(trajectory_id)->GetGroundLabelledPointCloud());
+  }
 }
 
 void Node::SerializeState(const std::string& filename,
