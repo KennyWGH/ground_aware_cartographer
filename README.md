@@ -4,21 +4,16 @@
 This is a **ground aware** version of cartographer(3D) project!
 
 In this project, **ground points are detected and used to construct ground-alignment constraints, which help to get better roll&pitch estimate**.   
-To be more specific, an [efficient online ground segmentation]() method is adopted to detect ground points for each scan, and a local map of ground points is maintained with [ikd-Tree](https://github.com/hku-mars/ikd-Tree) [(中文解析)](https://zhuanlan.zhihu.com/p/529926254) structure. During the correlative scan match, a scan-to-submap alignment is first conducted to adjust x, y, z and yaw, then a scan-to-local map manner ground plane alignment is conducted to optimize roll and pitch.  
+To be more specific, an [efficient online ground segmentation](https://github.com/KennyWGH/efficient_online_segmentation) method is adopted to detect ground points for each scan, and a local map of ground points is maintained with [ikd-Tree](https://github.com/hku-mars/ikd-Tree) [(中文解析)](https://zhuanlan.zhihu.com/p/529926254) structure. During the correlative scan match, a scan-to-submap alignment is first conducted to adjust x, y, z and yaw, then a scan-to-local map manner ground plane alignment is conducted to optimize roll and pitch.  
 
-The performance of ground_aware_cartographer has been verified, see the gif below to learn more.
+The performance of ground_aware_cartographer has been verified, the gif below shows the result of a 200*100 square meters dataset.  
+![all test video](docs/final_02.gif)
 
-    video.
+**It is important to realize that taking ground constraint into consideration do help to reduce Z drift!**  See the picture below: the original Google cartographer suffers from severe z drift when passing through a valley-like area, while ground_aware_cartographer does not have that problem.  
+![compare](docs/compare.png)
 
-**It is important to realize that taking ground constraint into consideration do help to reduce Z drift!**  See the picture below: the original Google cartographer suffers from severe z drift when passing through a valley-like area, while ground_aware_cartographer does not have that problem.
-
-    picture.
-
-
-Picture below shows how local map works in detail: it only contain ground pionts of nearby key frames, and always move with robot. With the help of ikd-Tree, maintaining such a local map is not expensive at all.
-
-    video.
-
+Picture below shows how local map works in low playback speed: it only contain ground pionts of nearby key frames, and always move with robot. With the help of ikd-Tree, maintaining such a local map is not expensive at all.  
+![ikdtree local map](docs/final_01.gif)
 
 
 ## 2. Dependencies
